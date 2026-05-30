@@ -152,8 +152,11 @@ async def admin_state(admin_token: str = Depends(get_admin_token)):
 
 @app.post("/admin/external-connections/enable")
 async def admin_enable_external_connections(cfg: ExternalConnectionsToggle, admin_token: str = Depends(get_admin_token)):
-    global EXTERNAL_CONNECTIONS_ENABLED
+    global EXTERNAL_CONNECTIONS_ENABLED, OUTGOING_PUSH_CONFIG
     EXTERNAL_CONNECTIONS_ENABLED = cfg.enabled
+    # If enabling receive, disable push (mutually exclusive)
+    if cfg.enabled:
+        OUTGOING_PUSH_CONFIG["enabled"] = False
     return {"status": "success", "external_connections_enabled": EXTERNAL_CONNECTIONS_ENABLED}
 
 
@@ -174,6 +177,7 @@ async def admin_register_peer(peer: PeerRegistration, admin_token: str = Depends
 
 @app.post("/admin/push-config")
 async def admin_configure_push(cfg: PushConfig, admin_token: str = Depends(get_admin_token)):
+    global OUTGOING_PUSH_CONFIG, EXTERNAL_CONNECTIONS_ENABLED
     key = cfg.shared_key or SHARED_PSK
     if key != SHARED_PSK:
         raise HTTPException(status_code=403, detail="Invalid shared key")
@@ -181,6 +185,9 @@ async def admin_configure_push(cfg: PushConfig, admin_token: str = Depends(get_a
     OUTGOING_PUSH_CONFIG["enabled"] = cfg.enabled
     OUTGOING_PUSH_CONFIG["target_url"] = cfg.target_url
     OUTGOING_PUSH_CONFIG["interval_seconds"] = max(2, int(cfg.interval_seconds or 2))
+    # If enabling push, disable receive (mutually exclusive)
+    if cfg.enabled:
+        EXTERNAL_CONNECTIONS_ENABLED = False
     return {"status": "success", "push_config": OUTGOING_PUSH_CONFIG}
 
 
