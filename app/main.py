@@ -33,20 +33,26 @@ OUTGOING_PUSH_CONFIG = {
     "interval_seconds": 2,
 }
 
+# In-memory cache for aircraft data
+aircraft_data_cache = {
+    "now": 0,
+    "messages": 0,
+    "aircraft": [],
+}
+
+# List of registered SDR sources
+sdr_sources = []
+
+
 def get_api_key(api_key: str = Security(api_key_header)):
     if api_key != API_KEY:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Forbidden: Invalid or missing API Key"
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Forbidden: Invalid or missing API Key")
     return api_key
+
 
 def get_admin_token(admin_token: str = Security(admin_token_header)):
     if admin_token != ADMIN_TOKEN:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Forbidden: Invalid Admin Token"
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Forbidden: Invalid Admin Token")
     return admin_token
 
 
@@ -79,10 +85,7 @@ async def ingest_sdr_data(
     if api_key != API_KEY and psk != SHARED_PSK:
         raise HTTPException(status_code=401, detail="Forbidden: Invalid API Key or shared peer key")
 
-    entry = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "payload": payload
-    }
+    entry = {"timestamp": datetime.utcnow().isoformat() + "Z", "payload": payload}
 
     # load existing
     try:
@@ -126,6 +129,11 @@ class PushConfig(BaseModel):
     shared_key: str | None = None
 
 
+class SDRSource(BaseModel):
+    name: str
+    url: str
+
+
 @app.post("/api/admin/command")
 async def admin_control(command: AdminCommand, admin_token: str = Depends(get_admin_token)):
     """
@@ -151,28 +159,15 @@ async def admin_state(admin_token: str = Depends(get_admin_token)):
 
 
 @app.post("/admin/external-connections/enable")
-async def admin_enable_external_connections(cfg: ExternalConnectionsToggle, admin_token: str = Depends(get_admin_token)):
+async def admin_enable_external_connections(
+    cfg: ExternalConnectionsToggle, admin_token: str = Depends(get_admin_token)
+):
     global EXTERNAL_CONNECTIONS_ENABLED, OUTGOING_PUSH_CONFIG
     EXTERNAL_CONNECTIONS_ENABLED = cfg.enabled
     # If enabling receive, disable push (mutually exclusive)
     if cfg.enabled:
         OUTGOING_PUSH_CONFIG["enabled"] = False
     return {"status": "success", "external_connections_enabled": EXTERNAL_CONNECTIONS_ENABLED}
-
-
-@app.post("/admin/peers/register")
-async def admin_register_peer(peer: PeerRegistration, admin_token: str = Depends(get_admin_token)):
-    key = peer.shared_key or SHARED_PSK
-    if key != SHARED_PSK:
-        raise HTTPException(status_code=403, detail="Invalid shared key")
-
-    REGISTERED_PEERS[peer.peer_name] = {
-        "peer_name": peer.peer_name,
-        "peer_url": peer.peer_url,
-        "shared_key": SHARED_PSK,
-        "registered_at": datetime.utcnow().isoformat() + "Z",
-    }
-    return {"status": "success", "peer": REGISTERED_PEERS[peer.peer_name]}
 
 
 @app.post("/admin/push-config")
@@ -189,6 +184,39 @@ async def admin_configure_push(cfg: PushConfig, admin_token: str = Depends(get_a
     if cfg.enabled:
         EXTERNAL_CONNECTIONS_ENABLED = False
     return {"status": "success", "push_config": OUTGOING_PUSH_CONFIG}
+
+
+async def fetch_sdr_sources_from_sentinel():
+    """Periodically fetch the list of available SDRs from the Sentinel container."""
+    sentinel_url = os.getenv("OPT_SENTINEL_URL", "http://sentinel:8001/api/sdrs")
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                r = await client.get(sentinel_url, timeout=10)
+                if r.status_code == 200:
+                    global sdr_sources
+                    sdr_sources = r.json()
+            except Exception as e:
+                print(f"Error fetching SDR sources from Sentinel: {e}")
+            await asyncio.sleep(20)
+
+
+@app.post("/admin/sdr-sources")
+async def admin_add_sdr_source(source: SDRSource, admin_token: str = Depends(get_admin_token)):
+    """Add or update an SDR source."""
+    global sdr_sources
+    # Remove existing source with the same name
+    sdr_sources = [s for s in sdr_sources if s["name"] != source.name]
+    sdr_sources.append({"name": source.name, "url": source.url})
+    return {"status": "success", "sdr_sources": sdr_sources}
+
+
+@app.delete("/admin/sdr-sources/{name}")
+async def admin_delete_sdr_source(name: str, admin_token: str = Depends(get_admin_token)):
+    """Delete an SDR source."""
+    global sdr_sources
+    sdr_sources = [s for s in sdr_sources if s["name"] != name]
+    return {"status": "success", "sdr_sources": sdr_sources}
 
 
 async def fetch_url(client: httpx.AsyncClient, url: str, headers: dict | None = None):
@@ -216,6 +244,9 @@ async def collate_sources() -> dict:
     # Prepare URLs from env
     sdr_urls = [u.strip() for u in os.getenv("OPT_SDR_URLS", "").split(",") if u.strip()]
     external_urls = [u.strip() for u in os.getenv("OPT_EXTERNAL_URLS", "").split(",") if u.strip()]
+
+    # Add dynamically registered SDR sources
+    sdr_urls.extend([s["url"] for s in sdr_sources])
 
     collected_aircraft = []
 
@@ -269,21 +300,25 @@ async def push_collated_once(target_url: str):
 @app.get("/api/collated")
 async def get_collated():
     """Return collated JSON (and update the on-disk collated file)."""
-    data = await collate_and_write()
-    return data
+    return aircraft_data_cache
 
 
 @app.on_event("startup")
 async def startup_tasks():
+    # Start the background task to fetch SDR sources from Sentinel
+    asyncio.create_task(fetch_sdr_sources_from_sentinel())
+
     # Optionally run a periodic collate in background if OPT_AUTOCOLLATE is set
     if os.getenv("OPT_AUTOCOLLATE", "1") == "1":
+
         async def periodic():
             while True:
                 try:
-                    await collate_and_write()
+                    global aircraft_data_cache
+                    aircraft_data_cache = await collate_and_write()
                 except Exception:
                     pass
-                await asyncio.sleep(int(os.getenv("OPT_COLLATE_INTERVAL", "10")))
+                await asyncio.sleep(2)
 
         asyncio.create_task(periodic())
 
