@@ -20,6 +20,7 @@ if os.path.exists("/config/admin_token.txt"):
 
 API_KEY = os.getenv("OPT_SERVER_API_KEY", "default-secure-key-change-me")
 SHARED_PSK = os.getenv("OPT_SHARED_PSK", "default-shared-psk")
+SENTINEL_DISCOVERY_URL = os.getenv("OPT_SENTINEL_DISCOVERY_URL", "http://sentinel:8001/api/sdrs")
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 admin_token_header = APIKeyHeader(name="X-Admin-Token", auto_error=False)
@@ -228,6 +229,82 @@ async def fetch_url(client: httpx.AsyncClient, url: str, headers: dict | None = 
         return None
 
 
+def normalize_aircraft_payload(payload: dict) -> tuple[list[dict], int | None, float | None]:
+    """Normalize an ADSB payload into safe aircraft records.
+
+    - Keeps only dict aircraft rows.
+    - Ensures `flight` falls back to `hex` when missing/blank.
+    - Returns a best-effort `messages` total and source `now` value.
+    """
+    aircraft = payload.get("aircraft", [])
+    if not isinstance(aircraft, list):
+        aircraft = []
+
+    normalized: list[dict] = []
+    for item in aircraft:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        flight = str(row.get("flight", "") or "").strip()
+        hex_code = str(row.get("hex", "") or "").strip()
+        if not flight or flight.lower() in {"none", "nan"}:
+            row["flight"] = hex_code
+        else:
+            row["flight"] = flight
+        if hex_code:
+            row["hex"] = hex_code
+        normalized.append(row)
+
+    messages_value = payload.get("messages", None)
+    try:
+        messages_value = int(messages_value) if messages_value is not None else len(normalized)
+    except Exception:
+        messages_value = len(normalized)
+
+    now_value = payload.get("now", None)
+    try:
+        now_value = float(now_value) if now_value is not None else None
+    except Exception:
+        now_value = None
+
+    return normalized, messages_value, now_value
+
+
+async def discover_sdr_base_urls_from_sentinel(client: httpx.AsyncClient) -> list[str]:
+    """Ask Sentinel for the current readsb containers and build their base URLs."""
+    try:
+        response = await client.get(SENTINEL_DISCOVERY_URL, timeout=5.0)
+        if response.status_code != 200:
+            return []
+        sdrs = response.json()
+        if not isinstance(sdrs, list):
+            return []
+
+        urls: list[str] = []
+        for sdr in sdrs:
+            if not isinstance(sdr, dict):
+                continue
+            if str(sdr.get("status", "")).lower() != "running":
+                continue
+            ip = str(sdr.get("ip", "")).strip()
+            if not ip or ip == "unknown":
+                continue
+            urls.append(f"http://{ip}:8080")
+        return urls
+    except Exception:
+        return []
+
+
+async def fetch_adsb_payload(client: httpx.AsyncClient, base_url: str, headers: dict | None = None):
+    """Fetch the first successful readsb JSON endpoint for a base URL."""
+    candidate_paths = ["/data/aircraft.json", "/aircraft.json"]
+    for path in candidate_paths:
+        result = await fetch_url(client, f"{base_url}{path}", headers=headers)
+        if isinstance(result, dict) and "aircraft" in result:
+            return result
+    return None
+
+
 async def collate_sources() -> dict:
     """Collect data from local ingests, configured SDR URLs and external URLs.
     Returns a dict with a single top-level 'aircraft' array for compatibility with UI.
@@ -241,27 +318,36 @@ async def collate_sources() -> dict:
     except Exception:
         local_list = []
 
-    # Prepare URLs from env
+    # Prepare URLs from Sentinel-discovered SDRs, plus optional manual overrides
     sdr_urls = [u.strip() for u in os.getenv("OPT_SDR_URLS", "").split(",") if u.strip()]
     external_urls = [u.strip() for u in os.getenv("OPT_EXTERNAL_URLS", "").split(",") if u.strip()]
 
     # Add dynamically registered SDR sources
     sdr_urls.extend([s["url"] for s in sdr_sources])
 
-    collected_aircraft = []
+    collected_aircraft: list[dict] = []
+    total_messages = 0
+    latest_now: float | None = None
 
     # local entries might already contain airplane lists under payload['aircraft']
     for e in local_list:
         try:
             p = e.get("payload", {})
             if isinstance(p, dict) and "aircraft" in p and isinstance(p["aircraft"], list):
-                collected_aircraft.extend(p["aircraft"])
+                normalized_aircraft, messages_value, now_value = normalize_aircraft_payload(p)
+                collected_aircraft.extend(normalized_aircraft)
+                total_messages += messages_value or 0
+                if now_value is not None:
+                    latest_now = now_value if latest_now is None else max(latest_now, now_value)
         except Exception:
             continue
 
     headers = {"X-API-Key": API_KEY}
     async with httpx.AsyncClient() as client:
         tasks = []
+        discovered_sdr_base_urls = await discover_sdr_base_urls_from_sentinel(client)
+        for u in discovered_sdr_base_urls:
+            tasks.append(fetch_adsb_payload(client, u, headers=headers))
         for u in sdr_urls + external_urls:
             tasks.append(fetch_url(client, u, headers=headers))
 
@@ -269,12 +355,16 @@ async def collate_sources() -> dict:
 
     for res in results:
         if isinstance(res, dict) and "aircraft" in res and isinstance(res["aircraft"], list):
-            collected_aircraft.extend(res["aircraft"])  # merge lists
+            normalized_aircraft, messages_value, now_value = normalize_aircraft_payload(res)
+            collected_aircraft.extend(normalized_aircraft)  # merge lists
+            total_messages += messages_value or 0
+            if now_value is not None:
+                latest_now = now_value if latest_now is None else max(latest_now, now_value)
 
     # Final shape matching the requested format: { now, messages, aircraft }
     out = {
-        "now": float(datetime.utcnow().timestamp()),
-        "messages": len(collected_aircraft),
+        "now": latest_now if latest_now is not None else float(datetime.utcnow().timestamp()),
+        "messages": total_messages if total_messages > 0 else len(collected_aircraft),
         "aircraft": collected_aircraft,
     }
     return out
